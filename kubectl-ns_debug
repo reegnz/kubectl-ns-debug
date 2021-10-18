@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+image="ubuntu:20.04"
+node=""
+while [[ $# -gt 0 ]]; do
+  key=$1
+  case $key in
+  --namespace|-n)
+    ns=$2
+    shift
+    shift
+    continue
+    ;;
+  --container)
+    container=$2
+    shift
+    shift
+    continue
+    ;;
+  --image)
+    image=$2
+    shift
+    shift
+    continue
+    ;;
+  --*)
+    echo "Unsupported option: $key" >&2
+    exit 1
+    ;;
+  *)
+    if [ -n "${pod:-}" ]; then
+      echo "Pod already defined: $pod" >&2
+      exit 1
+    fi
+    pod=$key
+    shift
+    continue
+    ;;
+  esac
+done
+
+if [ -z "${pod:-}" ]; then
+  echo "No pod name defined." >&2
+  exit 1
+fi
+
+get_container_info() {
+  kubectl get pod ${ns+-n $ns} "$pod" -o json |
+  jq '[
+    (.metadata|{namespace,name}) +
+    (.spec|{node: .nodeName}) +
+    (.status.containerStatuses[]|{
+      container_name: .name, container_id: .containerID
+    })
+  ]'
+}
+
+container_info="$(get_container_info)"
+
+if [ -z "${container:-}" ]; then
+  # if no container defined, take first one
+  container_name=$(jq -r '.[0].container_name' <<<"$container_info")
+fi
+container_id="$(jq -r --arg name "$container_name" 'map(select(.container_name == $name))[0].container_id' <<<"$container_info")"
+node="$(jq -r '.[].node' <<<"$container_info")"
+
+
+script="$(cat <<-EOF
+set -x
+echo "Figuring out PID of container \$TARGET_CONTAINER_NAME..." >&2
+case "\${TARGET_CONTAINER_ID%%:*}" in
+docker)
+  PID="\$(nsenter -t 1 -m -p -u -i -- docker inspect -f '{{.State.Pid}}' "\${TARGET_CONTAINER_ID#docker://}")"
+  ;;
+containerd)
+  PID="\$(nsenter -t 1 -m -p -u -i -- crictl inspect -o go-template --template '{{.info.pid}}' "\${TARGET_CONTAINER_ID#containerd://}")"
+  ;;
+*)
+  echo "Unknown runtime for container \$TARGET_CONTAINER_NAME: \$TARGET_CONTAINER_ID" >&2
+  exit 1
+  ;;
+esac
+echo "Entering PID: \$PID" >&2
+exec nsenter --target \$PID -u -i -n -p -- unshare -m sh -c 'mount -t proc procfs /proc/; exec sh'
+EOF
+)"
+
+
+overrides="$(
+jq --null-input \
+  --arg image "$image" \
+  --arg node "$node" \
+  --arg script "$script" \
+  --arg container_name "$container_name" \
+  --arg container_id "$container_id" \
+'
+{
+  spec: {
+    containers: [{
+      image: $image,
+      name: "debug",
+      securityContext: {
+        privileged: true,
+      },
+      stdin: true,
+      stdinOnce: true,
+      tty: true,
+      command: ["sh", "-c"],
+      args: [ $script ],
+      env: [{
+        name: "TARGET_CONTAINER_NAME",
+        value: $container_name,
+      },{
+        name: "TARGET_CONTAINER_ID",
+        value: $container_id,
+      }]
+    }],
+    hostPID: true,
+    hostNetwork: true,
+    nodeName: $node,
+    restart: "Never",
+  }
+}
+'
+)"
+
+trap "EC=\$?; kubectl delete pod --wait=false debug-it >/dev/null || true; exit \$EC" EXIT INT TERM
+echo "spawning debug-it on \"$node\""
+
+kubectl run debug-it -it --rm --image "$image" --overrides="$overrides"
