@@ -12,8 +12,8 @@ while [[ $# -gt 0 ]]; do
     shift
     continue
     ;;
-  --container)
-    container=$2
+  --container|-c)
+    container_name=$2
     shift
     shift
     continue
@@ -62,8 +62,9 @@ if [ -z "${container:-}" ]; then
   # if no container defined, take first one
   container_name=$(jq -r '.[0].container_name' <<<"$container_info")
 fi
+
 container_id="$(jq -r --arg name "$container_name" 'map(select(.container_name == $name))[0].container_id' <<<"$container_info")"
-node="$(jq -r '.[].node' <<<"$container_info")"
+node="$(jq -r --arg name "$container_name" 'map(select(.container_name == $name))[0].node' <<<"$container_info")"
 
 
 script="$(cat <<-EOF
@@ -125,7 +126,7 @@ jq --null-input \
 '
 )"
 
-trap "EC=\$?; kubectl delete pod --wait=false debug-it >/dev/null || true; exit \$EC" EXIT INT TERM
+trap "EC=\$?; kubectl delete pod ${ns+-n $ns} --wait=false debug-it >/dev/null || true; exit \$EC" EXIT INT TERM
 echo "spawning debug-it on \"$node\""
 
-kubectl run debug-it -it --rm --image "$image" --overrides="$overrides"
+kubectl run debug-it ${ns+-n $ns} -it --rm --image "$image" --overrides="$overrides"
